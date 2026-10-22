@@ -1,0 +1,40 @@
+# Inactive local candidate. Do not install in .github/workflows without approval.
+name: Public Linux runner canary
+
+on:
+  push:
+    branches:
+      - public-canary-once-20261022
+    paths:
+      - .github/workflows/canary.yml
+
+permissions: {}
+
+jobs:
+  canary:
+    if: github.event.created == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Test Python and hash synthetic result
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 - <<'PY' | tee out/test.log
+          import sys
+          assert 2 + 2 == 4
+          print("PLATFORM=" + sys.platform)
+          print("PUBLIC_CANARY_TEST=PASS")
+          PY
+          printf '%s\n' "$GITHUB_SHA" > out/SOURCE_SHA
+          (cd out && sha256sum test.log SOURCE_SHA > SHA256SUMS)
+
+      - name: Upload synthetic result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: public-canary-result
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
