@@ -1,0 +1,80 @@
+name: P0-3 one-time public synthetic A-to-B pilot
+
+on:
+  push:
+    branches:
+      - codex/p0-3-cloud-ab-pilot-20261028
+
+permissions:
+  contents: read
+
+jobs:
+  register:
+    if: github.event.created == true && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 tests/p0_3_cloud_ab_pilot.py register
+        env:
+          P0_3_STATE_ENDPOINT: ${{ secrets.P0_3_STATE_ENDPOINT }}
+          P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}
+
+  race_a1:
+    needs: register
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 tests/p0_3_cloud_ab_pilot.py race --owner runner-a1
+        env:
+          P0_3_STATE_ENDPOINT: ${{ secrets.P0_3_STATE_ENDPOINT }}
+          P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}
+
+  race_a2:
+    needs: register
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 tests/p0_3_cloud_ab_pilot.py race --owner runner-a2
+        env:
+          P0_3_STATE_ENDPOINT: ${{ secrets.P0_3_STATE_ENDPOINT }}
+          P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}
+
+  consume_b:
+    needs: [race_a1, race_a2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 tests/p0_3_cloud_ab_pilot.py consume
+        env:
+          P0_3_STATE_ENDPOINT: ${{ secrets.P0_3_STATE_ENDPOINT }}
+          P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}
+
+  verify:
+    needs: consume_b
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 tests/p0_3_cloud_ab_pilot.py verify
+        env:
+          P0_3_STATE_ENDPOINT: ${{ secrets.P0_3_STATE_ENDPOINT }}
+          P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}
