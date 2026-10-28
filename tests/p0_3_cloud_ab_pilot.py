@@ -17,6 +17,7 @@ REPOSITORY = "taotao829172/public-runner-canary"
 BRANCH_REF = "refs/heads/codex/p0-3-cloud-ab-pilot-20261028"
 PROJECT = "P0_3_SANDBOX"
 ENDPOINT_SHA256 = "ea8012ed8b12f437b238fabc1d9f7b0a0220f9c9c6116fae26388ed61cac9ec8"
+USER_AGENT = "p0-3-public-synthetic-pilot/1.0"
 LIMITS = {"register": 1, "race": 3, "consume": 9, "verify": 11}
 
 
@@ -86,6 +87,7 @@ class StateAPI:
         print(f"PILOT_REQUEST={self.count}:{action}", flush=True)
         request = Request(self.endpoint, data=body, method="POST", headers={
             "Content-Type": "application/json", "Authorization": "Bearer " + self.token,
+            "User-Agent": USER_AGENT,
         })
         try:
             with self.opener.open(request, timeout=10) as response:
@@ -303,7 +305,8 @@ def self_test():
         pass
     else:
         raise PilotError("SELFTEST_RERUN_ACCEPTED")
-    print(encoded({"phase": "self-test", "status": "PASS", "checks": 6}))
+    require(USER_AGENT == "p0-3-public-synthetic-pilot/1.0", "SELFTEST_USER_AGENT")
+    print(encoded({"phase": "self-test", "status": "PASS", "checks": 7}))
 
 
 def main():
