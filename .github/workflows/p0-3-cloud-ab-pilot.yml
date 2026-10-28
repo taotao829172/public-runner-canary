@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   register:
-    if: github.event.created == true && github.run_attempt == 1
+    if: github.run_attempt == 1 && github.event.before == '264ad27c7ae488cea9887673d8464d05c58518f4'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
