@@ -362,13 +362,37 @@ class ModelAPI:
                             usage["theoretical_upper_bound_neuron_microunits"])
 
 
+def schema_diagnostic(stage, output):
+    type_names = {dict: "object", list: "array", str: "string", int: "integer",
+                  float: "number", bool: "boolean", type(None): "null"}
+    fields = []
+    if isinstance(output, dict):
+        for name in sorted(output, key=str)[:64]:
+            encoded_name = str(name)
+            if len(encoded_name.encode("utf-8")) > 128:
+                encoded_name = "sha256:" + sha_text(encoded_name)[:16]
+            fields.append({"name": encoded_name,
+                           "type": type_names.get(type(output[name]), "other")})
+    return {"stage": stage, "top_level_type": type_names.get(type(output), "other"),
+            "fields": fields}
+
+
+def schema_failure(stage, output, code):
+    print("MODEL_SCHEMA_DIAGNOSTIC=" + encoded(schema_diagnostic(stage, output)),
+          file=sys.stderr)
+    raise PilotError(code)
+
+
 def validate_a_output(output, fact_count):
-    require(isinstance(output, dict) and set(output) == {"summary", "safety_invariant", "fact_count"}
-            and isinstance(output["summary"], str) and 1 <= len(output["summary"]) <= 500
-            and isinstance(output["safety_invariant"], str)
-            and 1 <= len(output["safety_invariant"]) <= 300
-            and type(output["fact_count"]) is int and output["fact_count"] == fact_count,
-            "A_SCHEMA_INVALID")
+    valid = (isinstance(output, dict)
+             and set(output) == {"summary", "safety_invariant", "fact_count"}
+             and isinstance(output["summary"], str) and 1 <= len(output["summary"]) <= 500
+             and isinstance(output["safety_invariant"], str)
+             and 1 <= len(output["safety_invariant"]) <= 300
+             and type(output["fact_count"]) is int
+             and output["fact_count"] == fact_count)
+    if not valid:
+        schema_failure("A", output, "A_SCHEMA_INVALID")
 
 
 def validate_receipt(receipt):
@@ -392,15 +416,19 @@ def validate_receipt(receipt):
 
 
 def validate_b_output(output, fact_count, source_a_sha):
-    require(isinstance(output, dict)
-            and set(output) == {"audit_status", "checked_fact_count", "discrepancies",
-                                "source_a_sha256"}
-            and output["audit_status"] in {"PASS", "FAIL"}
-            and type(output["checked_fact_count"]) is int
-            and output["checked_fact_count"] == fact_count
-            and isinstance(output["discrepancies"], list) and len(output["discrepancies"]) <= 5
-            and all(isinstance(item, str) and len(item) <= 300 for item in output["discrepancies"])
-            and output["source_a_sha256"] == source_a_sha, "B_SCHEMA_INVALID")
+    valid = (isinstance(output, dict)
+             and set(output) == {"audit_status", "checked_fact_count", "discrepancies",
+                                 "source_a_sha256"}
+             and output["audit_status"] in {"PASS", "FAIL"}
+             and type(output["checked_fact_count"]) is int
+             and output["checked_fact_count"] == fact_count
+             and isinstance(output["discrepancies"], list)
+             and len(output["discrepancies"]) <= 5
+             and all(isinstance(item, str) and len(item) <= 300
+                     for item in output["discrepancies"])
+             and output["source_a_sha256"] == source_a_sha)
+    if not valid:
+        schema_failure("B", output, "B_SCHEMA_INVALID")
 
 
 def assert_row(row, ctx, stage, status, version):
@@ -948,6 +976,29 @@ def self_test(root):
         BytesIO(b"x" * (MAX_ERROR_BODY_BYTES + 1)))
     require(safe_http_error_summary(oversized_error)["reason"] == "ERROR_BODY_TOO_LARGE",
             "SELFTEST_DIAGNOSTIC_BOUND")
+    checks += 1
+
+    schema_secret = "do-not-log-model-output-value"
+    for stage, output, validator, args, expected_field in (
+        ("A", {"unexpected_a": schema_secret}, validate_a_output, (5,), "unexpected_a"),
+        ("B", {"audit_status": schema_secret}, validate_b_output,
+         (5, "a" * 64), "audit_status"),
+    ):
+        captured = StringIO()
+        with redirect_stderr(captured):
+            try:
+                validator(output, *args)
+            except PilotError as error:
+                require(str(error) == f"{stage}_SCHEMA_INVALID",
+                        "SELFTEST_SCHEMA_DIAGNOSTIC_REASON")
+            else:
+                raise PilotError("SELFTEST_SCHEMA_DIAGNOSTIC_ACCEPTED")
+        text = captured.getvalue()
+        require(schema_secret not in text
+                and "MODEL_SCHEMA_DIAGNOSTIC=" in text
+                and f'"name":"{expected_field}"' in text
+                and '"type":"string"' in text,
+                "SELFTEST_SCHEMA_DIAGNOSTIC_LEAK_OR_MISSING")
     checks += 1
 
     refused = FakeOpener({"status": "RECONCILE_REQUIRED",

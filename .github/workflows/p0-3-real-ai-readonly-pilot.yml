@@ -13,7 +13,7 @@ env:
 
 jobs:
   register:
-    if: github.run_attempt == 1 && github.event.created == false && github.event.deleted == false && github.event.forced == false && github.event.before == 'd7dacd89f8f7d8edeff5ced55880608e19de8715'
+    if: github.run_attempt == 1 && github.event.created == false && github.event.deleted == false && github.event.forced == false && github.event.before == '095714382fcaa04bbadaee7c1f5055a379436b0e'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
