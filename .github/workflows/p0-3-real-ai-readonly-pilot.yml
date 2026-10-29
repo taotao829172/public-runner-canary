@@ -13,7 +13,7 @@ env:
 
 jobs:
   register:
-    if: github.event.created == true && github.run_attempt == 1
+    if: github.run_attempt == 1 && github.event.created == false && github.event.deleted == false && github.event.forced == false && github.event.before == 'e6e382d05adf3e14f384070cd37f49922ba223cf'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -55,7 +55,7 @@ jobs:
           P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}
 
   verify:
-    if: always()
+    if: always() && needs.register.result != 'skipped'
     needs: [register, ai_a, ai_b]
     runs-on: ubuntu-latest
     timeout-minutes: 5
