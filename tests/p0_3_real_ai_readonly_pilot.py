@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr
 from dataclasses import dataclass
 from decimal import Decimal
 import hashlib
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -30,10 +32,12 @@ MAX_INPUT_TOKENS = 8_000
 MAX_OUTPUT_TOKENS = 1_000
 MAX_INPUT_BYTES = 8_000
 MAX_RESULT_BYTES = 6_000
-MAX_NEURONS_PER_CALL = Decimal("250")
-MAX_NEURONS_PER_RUN = Decimal("500")
+MAX_NEURONS_PER_CALL = Decimal("80.4")
+MAX_NEURONS_PER_RUN = Decimal("160.8")
 INPUT_NEURONS_PER_MILLION = 5_500
 OUTPUT_NEURONS_PER_MILLION = 36_400
+THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS = 80_400_000
+MAX_ERROR_BODY_BYTES = 65_536
 MAX_RECOVERY_WAIT_SECONDS = 240
 STATE_LIMITS = {"register": 1, "ai-a": 7, "ai-b": 9, "verify": 12}
 RESPONSE_ID = re.compile(r"^cf_[0-9a-f]{64}$")
@@ -108,23 +112,33 @@ def stored_neurons(payload):
             "STORED_NEURONS_INVALID")
     usage = payload.get("usage")
     require(isinstance(usage, dict)
-            and set(usage) == {"input_tokens", "output_tokens", "neuron_microunits"}
+            and set(usage) == {"input_tokens", "output_tokens", "neuron_microunits",
+                               "usage_source",
+                               "theoretical_upper_bound_neuron_microunits"}
             and type(usage["input_tokens"]) is int
             and 0 <= usage["input_tokens"] <= MAX_INPUT_TOKENS
             and type(usage["output_tokens"]) is int
             and 0 <= usage["output_tokens"] <= MAX_OUTPUT_TOKENS
-            and type(usage["neuron_microunits"]) is int,
+            and type(usage["neuron_microunits"]) is int
+            and usage["usage_source"] in {"ACTUAL", "THEORETICAL_UPPER_BOUND"}
+            and usage["theoretical_upper_bound_neuron_microunits"]
+            == THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS,
             "STORED_USAGE_INVALID")
     expected = neuron_microunits(usage["input_tokens"], usage["output_tokens"])
     pricing = payload.get("pricing_basis")
     require(pricing == {"input_neurons_per_million": 5500,
                         "output_neurons_per_million": 36400,
-                        "max_neurons_per_call": "250",
-                        "max_neurons_per_run": "500"}, "STORED_PRICING_INVALID")
+                        "max_neurons_per_call": "80.4",
+                        "max_neurons_per_run": "160.8"}, "STORED_PRICING_INVALID")
     require(usage["neuron_microunits"] == expected
             and value == neuron_text(expected)
             and Decimal(value) <= MAX_NEURONS_PER_CALL,
             "STORED_NEURONS_MISMATCH")
+    if usage["usage_source"] == "THEORETICAL_UPPER_BOUND":
+        require((usage["input_tokens"], usage["output_tokens"], expected)
+                == (MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+                    THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS),
+                "STORED_THEORETICAL_USAGE_INVALID")
     return expected
 
 
@@ -222,6 +236,49 @@ class ModelReceipt:
     input_tokens: int
     output_tokens: int
     neuron_microunits: int
+    usage_source: str
+    theoretical_upper_bound_neuron_microunits: int
+
+
+def safe_http_error_summary(error):
+    payload = error.read(MAX_ERROR_BODY_BYTES + 1)
+    if len(payload) > MAX_ERROR_BODY_BYTES:
+        return {"status": "RECONCILE_REQUIRED", "reason": "ERROR_BODY_TOO_LARGE",
+                "provider_code": None, "top_level_fields": [],
+                "usage_fields": [], "content_fields": []}
+    try:
+        body = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError):
+        body = {}
+    status = body.get("status")
+    reason = body.get("reason")
+    provider_code = body.get("provider_code")
+    if not isinstance(status, str) or not re.fullmatch(r"[A-Z0-9_]{1,64}", status):
+        status = "RECONCILE_REQUIRED"
+    if not isinstance(reason, str) or not re.fullmatch(r"[A-Z0-9_]{1,64}", reason):
+        reason = "MODEL_HTTP_ERROR"
+    if type(provider_code) is not int:
+        provider_code = None
+    allowed_types = {"undefined", "null", "array", "object",
+                     "string", "number", "boolean"}
+
+    def descriptors(value):
+        if not isinstance(value, list) or len(value) > 64:
+            return []
+        result = []
+        for item in value:
+            if (not isinstance(item, dict) or set(item) != {"name", "type"}
+                    or not isinstance(item["name"], str)
+                    or not re.fullmatch(r"[A-Za-z0-9_.\[\]-]{1,128}", item["name"])
+                    or item["type"] not in allowed_types):
+                return []
+            result.append({"name": item["name"], "type": item["type"]})
+        return result
+
+    return {"status": status, "reason": reason, "provider_code": provider_code,
+            "top_level_fields": descriptors(body.get("top_level_fields")),
+            "usage_fields": descriptors(body.get("usage_fields")),
+            "content_fields": descriptors(body.get("content_fields"))}
 
 
 class ModelAPI:
@@ -248,7 +305,7 @@ class ModelAPI:
             "fixture_sha256": FIXTURE_SHA256, "prompt": prompt,
             "max_input_tokens": MAX_INPUT_TOKENS,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
-            "max_neurons": 250, "tools": [],
+            "max_neurons": 80.4, "tools": [],
         }
         raw = encoded(request_body).encode("utf-8")
         print(f"MODEL_CALL={self.count}:{stage}:request_sha256={hashlib.sha256(raw).hexdigest()}",
@@ -264,7 +321,9 @@ class ModelAPI:
             require(len(payload) <= 1_048_576, "MODEL_RESPONSE_TOO_LARGE")
             result = json.loads(payload)
         except HTTPError as error:
-            raise ModelError(f"MODEL_HTTP_{error.code}") from None
+            summary = safe_http_error_summary(error)
+            print("MODEL_HTTP_DIAGNOSTIC=" + encoded(summary), file=sys.stderr)
+            raise ModelError(f"MODEL_HTTP_{error.code}_{summary['reason']}") from None
         except (URLError, OSError, ValueError, TypeError, UnicodeError):
             raise ModelError("MODEL_UNAVAILABLE") from None
         require(isinstance(result, dict) and result.get("status") == "PASS"
@@ -277,18 +336,30 @@ class ModelAPI:
                 and isinstance(value.get("output"), dict), "MODEL_RESPONSE_SCOPE")
         usage = value.get("usage")
         require(isinstance(usage, dict)
-                and set(usage) == {"input_tokens", "output_tokens", "neuron_microunits"}
+                and set(usage) == {"input_tokens", "output_tokens", "neuron_microunits",
+                                   "usage_source",
+                                   "theoretical_upper_bound_neuron_microunits"}
                 and type(usage.get("input_tokens")) is int and usage["input_tokens"] >= 0
                 and type(usage.get("output_tokens")) is int and usage["output_tokens"] >= 0
                 and type(usage.get("neuron_microunits")) is int
+                and usage.get("usage_source") in {"ACTUAL", "THEORETICAL_UPPER_BOUND"}
+                and usage.get("theoretical_upper_bound_neuron_microunits")
+                == THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS
                 and usage["input_tokens"] <= MAX_INPUT_TOKENS
                 and usage["output_tokens"] <= MAX_OUTPUT_TOKENS, "MODEL_USAGE_INVALID")
         expected = neuron_microunits(usage["input_tokens"], usage["output_tokens"])
         require(usage["neuron_microunits"] == expected
                 and Decimal(neuron_text(expected)) <= MAX_NEURONS_PER_CALL,
                 "MODEL_NEURON_LIMIT")
+        if usage["usage_source"] == "THEORETICAL_UPPER_BOUND":
+            require((usage["input_tokens"], usage["output_tokens"], expected)
+                    == (MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+                        THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS),
+                    "MODEL_USAGE_INVALID")
         return ModelReceipt(value["response_id"], value["output"], usage["input_tokens"],
-                            usage["output_tokens"], usage["neuron_microunits"])
+                            usage["output_tokens"], usage["neuron_microunits"],
+                            usage["usage_source"],
+                            usage["theoretical_upper_bound_neuron_microunits"])
 
 
 def validate_a_output(output, fact_count):
@@ -307,8 +378,17 @@ def validate_receipt(receipt):
             and type(receipt.neuron_microunits) is int
             and receipt.neuron_microunits
             == neuron_microunits(receipt.input_tokens, receipt.output_tokens)
+            and receipt.usage_source in {"ACTUAL", "THEORETICAL_UPPER_BOUND"}
+            and receipt.theoretical_upper_bound_neuron_microunits
+            == THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS
             and Decimal(neuron_text(receipt.neuron_microunits)) <= MAX_NEURONS_PER_CALL,
             "MODEL_RECEIPT_INVALID")
+    if receipt.usage_source == "THEORETICAL_UPPER_BOUND":
+        require((receipt.input_tokens, receipt.output_tokens,
+                 receipt.neuron_microunits)
+                == (MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+                    THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS),
+                "MODEL_RECEIPT_INVALID")
 
 
 def validate_b_output(output, fact_count, source_a_sha):
@@ -356,11 +436,14 @@ def result_payload(ctx, stage, receipt, output, source_a_sha=None, cumulative=No
              "call_marker": sha_text(f"{ctx.authority}:{stage}:single-call"),
              "usage": {"input_tokens": receipt.input_tokens,
                        "output_tokens": receipt.output_tokens,
-                       "neuron_microunits": receipt.neuron_microunits},
+                       "neuron_microunits": receipt.neuron_microunits,
+                       "usage_source": receipt.usage_source,
+                       "theoretical_upper_bound_neuron_microunits":
+                       receipt.theoretical_upper_bound_neuron_microunits},
              "pricing_basis": {"input_neurons_per_million": 5500,
                                "output_neurons_per_million": 36400,
-                               "max_neurons_per_call": "250",
-                               "max_neurons_per_run": "500"},
+                               "max_neurons_per_call": "80.4",
+                               "max_neurons_per_run": "160.8"},
              "estimated_neurons": neuron_text(own_neurons), "output": output}
     if source_a_sha is not None:
         value["source_a_sha256"] = source_a_sha
@@ -376,11 +459,14 @@ def response_checkpoint(ctx, stage, receipt, result):
                     "response_id": receipt.response_id, "result_sha256": sha_text(result),
                     "usage": {"input_tokens": receipt.input_tokens,
                               "output_tokens": receipt.output_tokens,
-                              "neuron_microunits": receipt.neuron_microunits},
+                              "neuron_microunits": receipt.neuron_microunits,
+                              "usage_source": receipt.usage_source,
+                              "theoretical_upper_bound_neuron_microunits":
+                              receipt.theoretical_upper_bound_neuron_microunits},
                     "pricing_basis": {"input_neurons_per_million": 5500,
                                       "output_neurons_per_million": 36400,
-                                      "max_neurons_per_call": "250",
-                                      "max_neurons_per_run": "500"},
+                                      "max_neurons_per_call": "80.4",
+                                      "max_neurons_per_run": "160.8"},
                     "estimated_neurons": neuron_text(receipt.neuron_microunits)})
 
 
@@ -701,7 +787,8 @@ class FakeModel:
 
 
 def fake_receipt(stage, source=None, input_tokens=500, output_tokens=100,
-                 audit_status="PASS", discrepancies=None):
+                 audit_status="PASS", discrepancies=None,
+                 usage_source="ACTUAL"):
     output = ({"summary": "The fixture defines a bounded read-only two-stage check.",
                "safety_invariant": "Never retry a model call after uncertain persistence.",
                "fact_count": 5} if stage == "A" else
@@ -709,7 +796,8 @@ def fake_receipt(stage, source=None, input_tokens=500, output_tokens=100,
                "discrepancies": [] if discrepancies is None else discrepancies,
                "source_a_sha256": source})
     return ModelReceipt("cf_" + (stage.lower() * 64), output, input_tokens, output_tokens,
-                        neuron_microunits(input_tokens, output_tokens))
+                        neuron_microunits(input_tokens, output_tokens), usage_source,
+                        THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS)
 
 
 def test_context():
@@ -753,7 +841,10 @@ def self_test(root):
         "response_id": raw_a.response_id, "output": raw_a.output,
         "usage": {"input_tokens": raw_a.input_tokens,
                   "output_tokens": raw_a.output_tokens,
-                  "neuron_microunits": raw_a.neuron_microunits},
+                  "neuron_microunits": raw_a.neuron_microunits,
+                  "usage_source": raw_a.usage_source,
+                  "theoretical_upper_bound_neuron_microunits":
+                  raw_a.theoretical_upper_bound_neuron_microunits},
         "model": MODEL, "provider": "cloudflare-workers-ai",
         "billing_guard": "WORKERS_FREE_ONLY",
     }})
@@ -770,27 +861,93 @@ def self_test(root):
             and request_body["fixture_sha256"] == FIXTURE_SHA256
             and request_body["max_input_tokens"] == MAX_INPUT_TOKENS
             and request_body["max_output_tokens"] == MAX_OUTPUT_TOKENS
-            and request_body["max_neurons"] == 250
+            and request_body["max_neurons"] == 80.4
             and request_body["tools"] == []
             and headers.get("user-agent") == USER_AGENT
             and headers.get("authorization") == "Bearer " + "k" * 32,
             "SELFTEST_MODEL_TRANSPORT")
     checks += 1
 
+    theoretical = fake_receipt(
+        "A", input_tokens=MAX_INPUT_TOKENS, output_tokens=MAX_OUTPUT_TOKENS,
+        usage_source="THEORETICAL_UPPER_BOUND")
     missing_usage = FakeOpener({"status": "PASS", "result": {
-        "response_id": "cf_" + "a" * 64, "output": raw_a.output,
-        "usage": {}, "model": MODEL, "provider": "cloudflare-workers-ai",
+        "response_id": theoretical.response_id, "output": theoretical.output,
+        "usage": {
+            "input_tokens": theoretical.input_tokens,
+            "output_tokens": theoretical.output_tokens,
+            "neuron_microunits": theoretical.neuron_microunits,
+            "usage_source": theoretical.usage_source,
+            "theoretical_upper_bound_neuron_microunits":
+            theoretical.theoretical_upper_bound_neuron_microunits,
+        }, "model": MODEL, "provider": "cloudflare-workers-ai",
         "billing_guard": "WORKERS_FREE_ONLY",
     }})
     missing_model = ModelAPI("https://isolated.example.workers.dev/v1/ai",
                              "k" * 32, missing_usage)
+    parsed_theoretical = missing_model.call("A", prompt_a(fixture), A_SCHEMA)
+    require(parsed_theoretical == theoretical and missing_model.count == 1,
+            "SELFTEST_THEORETICAL_USAGE_INVALID")
+    checks += 1
+
+    malformed_usage = FakeOpener({"status": "PASS", "result": {
+        "response_id": raw_a.response_id, "output": raw_a.output,
+        "usage": {"input_tokens": 1, "output_tokens": 1,
+                  "neuron_microunits": 1, "usage_source": "ACTUAL",
+                  "theoretical_upper_bound_neuron_microunits":
+                  THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS},
+        "model": MODEL, "provider": "cloudflare-workers-ai",
+        "billing_guard": "WORKERS_FREE_ONLY",
+    }})
+    malformed_model = ModelAPI("https://isolated.example.workers.dev/v1/ai",
+                               "k" * 32, malformed_usage)
     try:
-        missing_model.call("A", prompt_a(fixture), A_SCHEMA)
+        malformed_model.call("A", prompt_a(fixture), A_SCHEMA)
     except PilotError:
         pass
     else:
-        raise PilotError("SELFTEST_MISSING_USAGE_ACCEPTED")
-    require(missing_model.count == 1, "SELFTEST_MISSING_USAGE_RETRIED")
+        raise PilotError("SELFTEST_MALFORMED_USAGE_ACCEPTED")
+    require(malformed_model.count == 1, "SELFTEST_MALFORMED_USAGE_RETRIED")
+    checks += 1
+
+    sensitive = "do-not-leak-prompt-output-secret"
+    diagnostic_body = encoded({
+        "status": "RECONCILE_REQUIRED", "reason": "MODEL_USAGE_INVALID",
+        "provider_code": None,
+        "top_level_fields": [{"name": "response", "type": "object"}],
+        "usage_fields": [{"name": "usage.input_tokens", "type": "string"}],
+        "content_fields": [{"name": "response.summary", "type": "string"}],
+        "prompt": sensitive, "output": sensitive, "secret": sensitive,
+    }).encode("utf-8")
+
+    class ErrorOpener:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def open(self, request, timeout):
+            raise HTTPError(request.full_url, 502, "synthetic", {}, BytesIO(self.payload))
+
+    diagnostic_model = ModelAPI("https://isolated.example.workers.dev/v1/ai",
+                                "k" * 32, ErrorOpener(diagnostic_body))
+    captured = StringIO()
+    with redirect_stderr(captured):
+        try:
+            diagnostic_model.call("A", prompt_a(fixture), A_SCHEMA)
+        except ModelError as error:
+            require(str(error) == "MODEL_HTTP_502_MODEL_USAGE_INVALID",
+                    "SELFTEST_DIAGNOSTIC_REASON")
+        else:
+            raise PilotError("SELFTEST_DIAGNOSTIC_HTTP_ACCEPTED")
+    diagnostic_text = captured.getvalue()
+    require(sensitive not in diagnostic_text
+            and "MODEL_HTTP_DIAGNOSTIC=" in diagnostic_text
+            and '"name":"usage.input_tokens"' in diagnostic_text,
+            "SELFTEST_DIAGNOSTIC_LEAK_OR_MISSING")
+    oversized_error = HTTPError(
+        "https://isolated.example.workers.dev/v1/ai", 502, "synthetic", {},
+        BytesIO(b"x" * (MAX_ERROR_BODY_BYTES + 1)))
+    require(safe_http_error_summary(oversized_error)["reason"] == "ERROR_BODY_TOO_LARGE",
+            "SELFTEST_DIAGNOSTIC_BOUND")
     checks += 1
 
     refused = FakeOpener({"status": "RECONCILE_REQUIRED",
@@ -857,11 +1014,14 @@ def self_test(root):
 
     for name, receipt, error in (
         ("missing-usage", ModelReceipt("cf_" + "b" * 64, fake_receipt("A").output,
-                                       -1, 1, -1), None),
+                                       -1, 1, -1, "ACTUAL",
+                                       THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS), None),
         ("over-budget", fake_receipt("A", input_tokens=8001), None),
         ("refusal", None, ModelError("MODEL_REFUSED")),
-        ("bad-schema", ModelReceipt("cf_" + "c" * 64, {"summary": "missing"},
-                                    1, 1, neuron_microunits(1, 1)), None),
+        ("bad-schema", ModelReceipt(
+            "cf_" + "c" * 64, {"summary": "missing"}, 1, 1,
+            neuron_microunits(1, 1), "ACTUAL",
+            THEORETICAL_UPPER_BOUND_NEURON_MICROUNITS), None),
     ):
         failed = FakeState()
         register(failed, ctx)
