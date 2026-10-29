@@ -1,0 +1,70 @@
+name: P0-3 one-time Workers-AI read-only A-to-B pilot
+
+on:
+  push:
+    branches:
+      - codex/p0-3-real-ai-readonly-pilot-20261028
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  register:
+    if: github.event.created == true && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 tests/p0_3_real_ai_readonly_pilot.py register
+        env:
+          P0_3_STATE_ENDPOINT: ${{ secrets.P0_3_STATE_ENDPOINT }}
+          P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}
+
+  ai_a:
+    needs: register
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 tests/p0_3_real_ai_readonly_pilot.py ai-a
+        env:
+          P0_3_STATE_ENDPOINT: ${{ secrets.P0_3_STATE_ENDPOINT }}
+          P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}
+
+  ai_b:
+    needs: ai_a
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 tests/p0_3_real_ai_readonly_pilot.py ai-b
+        env:
+          P0_3_STATE_ENDPOINT: ${{ secrets.P0_3_STATE_ENDPOINT }}
+          P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}
+
+  verify:
+    if: always()
+    needs: [register, ai_a, ai_b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 tests/p0_3_real_ai_readonly_pilot.py verify
+        env:
+          P0_3_STATE_ENDPOINT: ${{ secrets.P0_3_STATE_ENDPOINT }}
+          P0_3_TEST_TOKEN: ${{ secrets.P0_3_TEST_TOKEN }}

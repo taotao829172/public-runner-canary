@@ -1,0 +1,12 @@
+{
+  "facts": [
+    "The input is a fixed public synthetic fixture with no private or business data.",
+    "Task A must return a concise structured summary grounded only in these facts.",
+    "Task B must audit Task A against the same facts and cite Task A by SHA-256.",
+    "Every cloud task uses an atomic claim, a checkpoint, and an independently verified result.",
+    "A failed or uncertain model submission must stop without an automatic model retry."
+  ],
+  "kind": "public-real-ai-readonly-fixture",
+  "schema_version": 1,
+  "task": "Summarize the controls and identify the single most important safety invariant."
+}
